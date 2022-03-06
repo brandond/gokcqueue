@@ -2,9 +2,12 @@ package gokcqueue
 
 import (
 	"context"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 const initialBucketSize = 16
@@ -18,69 +21,30 @@ type entry struct {
 type entryList []*entry
 
 type KeyedCalendarQueue struct {
-	interrupt chan *entry
+	interrupt chan time.Time
 	bucketFor map[string]int
 	buckets   []entryList
-	events    chan interface{}
-	next      *entry
+	data      chan interface{}
+	cancel    context.CancelFunc
+	lock      sync.Mutex
+	closed    bool
 }
 
-func (q *KeyedCalendarQueue) insert(b int, n *entry) {
-	l := q.buckets[b]
-	pos := len(l)
-
-	for i, e := range l {
-		if e.when.Before(n.when) {
-			pos = i + 1
-			break
-		}
-	}
-
-	if pos == len(l) {
-		q.buckets[b] = append(l, n)
-		return
-	}
-
-	l = append(l[:pos+1], l[pos:]...)
-	l[pos] = n
-	q.buckets[b] = l
+func New(ctx context.Context) *KeyedCalendarQueue {
+	q := &KeyedCalendarQueue{}
+	q.start(ctx)
+	return q
 }
 
-func (q *KeyedCalendarQueue) remove(b int, key string) *entry {
-	l := q.buckets[b]
-	last := len(l)
-	for i, e := range l {
-		if e.key == key {
-			if i == last {
-				q.buckets[b] = l[:i]
-				return e
-			} else {
-				q.buckets[b] = append(l[:i], l[i+1:]...)
-				return e
-			}
-		}
-	}
-	return nil
-}
+func (q *KeyedCalendarQueue) Add(key string, when time.Time, data interface{}) (interface{}, bool, error) {
+	logrus.Debugf("Add: key=%s when=%v, data=%v", key, when, data)
 
-func (q *KeyedCalendarQueue) pop(b int) *entry {
-	l := q.buckets[b]
-	if len(l) < 1 {
-		return nil
+	if q.closed {
+		return nil, false, errors.New("closed")
 	}
-	q.buckets[b] = l[1:]
-	return l[0]
-}
+	q.lock.Lock()
+	defer q.lock.Unlock()
 
-func (q *KeyedCalendarQueue) peek(b int) *entry {
-	l := q.buckets[b]
-	if len(l) > 0 {
-		return l[0]
-	}
-	return nil
-}
-
-func (q *KeyedCalendarQueue) Add(key string, when time.Time, data interface{}) (interface{}, bool) {
 	if q.buckets == nil {
 		q.buckets = make([]entryList, initialBucketSize)
 	}
@@ -90,7 +54,7 @@ func (q *KeyedCalendarQueue) Add(key string, when time.Time, data interface{}) (
 	}
 
 	// if an entry with this key already exists, remove the current one
-	existing, ok := q.remove(key)
+	existing, ok := q.removeByKey(key)
 	if !ok {
 		existing = &entry{}
 	}
@@ -101,115 +65,111 @@ func (q *KeyedCalendarQueue) Add(key string, when time.Time, data interface{}) (
 		data: data,
 	}
 
-	if q.next == nil {
-		// had nothing to wait on, interrupt to wait on the new entry
-		defer q.sendInterrupt(created)
-	} else {
-		if created.when.Before(q.next.when) {
-			// new entry will fire before the one we were waiting on
-			defer q.sendInterrupt(created)
-		} else if q.next == existing {
-			// new entry replaced the entry that we were waiting on
-			defer q.sendInterrupt(existing)
-		}
-	}
-
-	q.add(created)
-	return existing.data, ok
-}
-
-func (q *KeyedCalendarQueue) add(e *entry) {
-	b := q.findBucket(e.when)
-	l := insert(q.buckets[b], e)
-	q.bucketFor[e.key] = b
-	q.buckets[b] = l
+	q.insert(created)
+	q.sendInterrupt(when)
+	return existing.data, ok, nil
 }
 
 func (q *KeyedCalendarQueue) Remove(key string) (time.Time, interface{}, error) {
-	if e, ok := q.remove(key); ok {
-		if q.next == e {
-			defer q.sendInterrupt(e)
-		}
+	logrus.Debugf("Remove: key=%s", key)
+	if q.closed {
+		return time.Time{}, nil, errors.New("closed")
+	}
+	q.lock.Lock()
+	defer q.lock.Unlock()
+
+	if e, ok := q.removeByKey(key); ok {
 		return e.when, e.data, nil
 	}
 
 	return time.Time{}, nil, errors.New("key not found")
 }
 
-func (q *KeyedCalendarQueue) remove(key string) (*entry, bool) {
-	if b, ok := q.bucketFor[key]; ok {
-		e, l := remove(q.buckets[b], key)
-		q.buckets[b] = l
-		delete(q.bucketFor, key)
-		return e, true
+func (q *KeyedCalendarQueue) Get() <-chan interface{} {
+	if q.data == nil {
+		q.start(context.Background())
 	}
-	return nil, false
+	return q.data
 }
 
-func (q *KeyedCalendarQueue) Events() <-chan interface{} {
-	if q.events == nil {
-		q.events = make(chan interface{}, 1)
-		q.interrupt = make(chan *entry, 1)
-		go q.eventLoop(context.Background())
+func (q *KeyedCalendarQueue) Close() {
+	if q.cancel != nil {
+		q.cancel()
 	}
-	return q.events
 }
 
-func (q *KeyedCalendarQueue) findBucket(t time.Time) int {
-	l := int64(len(q.buckets))
-	return int((t.Unix() / l) % l)
+func (q *KeyedCalendarQueue) start(ctx context.Context) {
+	ctxInner, cancel := context.WithCancel(context.Background())
+	q.lock.Lock()
+	defer q.lock.Unlock()
+
+	q.data = make(chan interface{})
+	q.interrupt = make(chan time.Time)
+	q.cancel = cancel
+	go q.timerLoop(ctxInner)
 }
 
-func (q *KeyedCalendarQueue) sameEpoch(a time.Time, b time.Time) bool {
-	l := int64(len(q.buckets))
-	return int(a.Unix()/l) == int(b.Unix()/l)
-}
-
-func (q *KeyedCalendarQueue) sendInterrupt(e *entry) {
+func (q *KeyedCalendarQueue) sendInterrupt(t time.Time) {
 	if q.interrupt != nil {
-		q.interrupt <- e
+		q.interrupt <- t
+		runtime.Gosched()
 	}
 }
 
-func (q *KeyedCalendarQueue) eventLoop(ctx context.Context) {
-	p := time.Time{}
-	t := time.NewTimer(0)
-	<-t.C
+func (q *KeyedCalendarQueue) timerLoop(ctx context.Context) {
+	var c, f bool
+	var n time.Time
+	var t *time.Timer = time.NewTimer(0)
 
 	for {
-		if q.next == nil {
-			q.next = q.getNextEntry(p)
-		}
-
-		// if we have an entry to wait for, reset the timer;
-		// otherwise, leave it read so that we wait on an interrupt.
-		if q.next != nil {
-			if !t.Stop() {
+		// if we have changed the next timer scheduling and it is non-zero, reset the timer.
+		if c && !n.IsZero() {
+			// stop the timer; drain the channel if necessary
+			if !t.Stop() && !f {
 				<-t.C
 			}
-			t.Reset(time.Until(q.next.when))
+			t.Reset(time.Until(n))
+			c = false
 		}
 
 		select {
 		case <-t.C:
-			q.events <- q.next.data
-			p = q.next.when
-			q.next = nil
-		case e := <-q.interrupt:
-			if q.next == e {
-				// interrupted by removal of the entry we were waiting on - treat it as handled and move on
-				p = q.next.when
-				q.next = nil
-			} else {
-				// interrupted by addition of a new entry that will fire before the one we were waiting on
-				if q.next != nil {
-					// If we were waiting on an entry, re-insert it into the queue
-					q.add(q.next)
+			f = true
+			for {
+				q.lock.Lock()
+				e := q.getNextEntry(n)
+				if e == nil {
+					// no more entries; wait for interrupt
+					q.lock.Unlock()
+					n = time.Time{}
+					break
+				} else if time.Until(e.when) > 0 {
+					// entry is not due yet, go back to waiting
+					q.lock.Unlock()
+					n = e.when
+					c = true
+					break
+				} else {
+					// entry is due, remove and return it
+					q.remove(e)
+					q.lock.Unlock()
+					q.data <- e.data
 				}
-				// start waiting on the new one instead
-				q.next = e
+			}
+		case i := <-q.interrupt:
+			if n.IsZero() || i.Before(n) {
+				// if the timer wasn't going to fire, or if the new entry is due before the timer would fire, reschedule
+				n = i
+				c = true
 			}
 		case <-ctx.Done():
+			// context cancelled - close the channel and remove data
+			q.lock.Lock()
+			close(q.data)
+			q.buckets = nil
+			q.bucketFor = nil
+			q.closed = true
+			q.lock.Unlock()
 			return
 		}
 	}
@@ -223,16 +183,16 @@ func (q *KeyedCalendarQueue) getNextEntry(t time.Time) *entry {
 		return e
 	}
 
-	// Step through the next round of epochs looking for events in their buckets, also noting the earliest entry we find
+	// Step through the next round of epochs looking for entries in their buckets, also noting the earliest entry we find
 	var n *entry
 	l := len(q.buckets)
 	for i := 1; i < l; i++ {
-		t = t.Add(time.Millisecond * time.Duration(l))
-		b = q.findBucket(t)
+		t = t.Add(time.Second * time.Duration(l))
+		b = (b + 1) % l
 		e := q.peek(b)
 		if e != nil {
 			if q.sameEpoch(t, e.when) {
-				return q.pop(b)
+				return e
 			}
 			if n == nil || e.when.Before(n.when) {
 				n = e
@@ -240,11 +200,115 @@ func (q *KeyedCalendarQueue) getNextEntry(t time.Time) *entry {
 		}
 	}
 
+	// TODO: add support for resizing the buckets based on distance between entries
+
 	// If we made it through all the buckets without finding an event in any of the epochs, jump forward to the next earliest event.
-	if n != nil {
-		b := q.findBucket(n.when)
-		return q.pop(b)
-	}
 	// If we didn't find an event at all then all the buckets are empty, which is fine.
+	return n
+}
+
+func (q *KeyedCalendarQueue) findBucket(t time.Time) int {
+	l := int64(len(q.buckets))
+	if l == 0 {
+		return 0
+	}
+	return int((t.Unix() / l) % l)
+}
+
+func (q *KeyedCalendarQueue) sameEpoch(a time.Time, b time.Time) bool {
+	l := int64(len(q.buckets))
+	if l == 0 {
+		return false
+	}
+	return int(a.Unix()/l) == int(b.Unix()/l)
+}
+
+func (q *KeyedCalendarQueue) insert(n *entry) {
+	b := q.findBucket(n.when)
+	if !(len(q.buckets) > b) {
+		return
+	}
+
+	l := q.buckets[b]
+	p := len(l) - 1
+
+	if p < 0 || n.when.After(l[p].when) {
+		// if the current list is empty, or if the new entry is after the last entry, just append
+		q.bucketFor[n.key] = b
+		q.buckets[b] = append(l, n)
+	} else {
+		// find the first entry that we should insert before
+		for i, e := range l {
+			if n.when.Before(e.when) {
+				p = i
+				break
+			}
+		}
+		l = append(l[:p+1], l[p:]...)
+		l[p] = n
+		q.buckets[b] = l
+	}
+
+	q.bucketFor[n.key] = b
+}
+
+func (q *KeyedCalendarQueue) remove(n *entry) bool {
+	b := q.findBucket(n.when)
+	if !(len(q.buckets) > b) {
+		return false
+	}
+
+	l := q.buckets[b]
+	last := len(l)
+	for i, e := range l {
+		if e == n {
+			if i == last {
+				q.buckets[b] = l[:i]
+				delete(q.bucketFor, n.key)
+				return true
+			} else {
+				q.buckets[b] = append(l[:i], l[i+1:]...)
+				delete(q.bucketFor, n.key)
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (q *KeyedCalendarQueue) removeByKey(key string) (*entry, bool) {
+	if b, ok := q.bucketFor[key]; ok {
+		if !(len(q.buckets) > b) {
+			return nil, false
+		}
+
+		l := q.buckets[b]
+		last := len(l)
+		for i, e := range l {
+			if e.key == key {
+				if i == last {
+					q.buckets[b] = l[:i]
+					delete(q.bucketFor, key)
+					return e, true
+				} else {
+					q.buckets[b] = append(l[:i], l[i+1:]...)
+					delete(q.bucketFor, key)
+					return e, true
+				}
+			}
+		}
+	}
+	return nil, false
+}
+
+func (q *KeyedCalendarQueue) peek(b int) *entry {
+	if !(len(q.buckets) > b) {
+		return nil
+	}
+
+	l := q.buckets[b]
+	if len(l) > 0 {
+		return l[0]
+	}
 	return nil
 }
