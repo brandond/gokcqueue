@@ -103,8 +103,8 @@ func (q *KeyedCalendarQueue) start(ctx context.Context) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
-	q.data = make(chan interface{})
-	q.interrupt = make(chan time.Time)
+	q.data = make(chan interface{}, 1)
+	q.interrupt = make(chan time.Time, 1)
 	q.cancel = cancel
 	go q.timerLoop(ctxInner)
 }

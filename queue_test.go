@@ -17,6 +17,32 @@ func init() {
 	logrus.SetLevel(logrus.DebugLevel)
 }
 
+func Benchmark_foo(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		testData := []string{"foo", "bar", "bar", "baz", "bop"}
+		ctx, cancel := context.WithCancel(context.Background())
+		q := New(ctx)
+
+		for i, s := range testData {
+			q.Add(s, time.Now().Add(time.Duration(i)*time.Second), d{s: s})
+		}
+
+		for e := range q.Get() {
+			r, ok := e.(d)
+			if !ok {
+				b.Logf("Got bad type from event!")
+			} else {
+				b.Logf("Got data from event: %s", r.s)
+				if r.s == "bop" {
+					break
+				}
+			}
+		}
+
+		cancel()
+	}
+}
+
 func Test_foo(t *testing.T) {
 	t.Run("foo", func(t *testing.T) {
 		want := []string{"foo", "bar", "zoop", "baz2", "bop2"}
